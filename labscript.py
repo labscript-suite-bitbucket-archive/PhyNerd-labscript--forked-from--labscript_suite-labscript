@@ -39,6 +39,10 @@ kHz = 1e3
 MHz = 1e6
 GHz = 1e9
 
+# Define constants for minimum and maximum values for the ordering parameter
+TRANSITION_ORDER_MINIMUM = -1
+TRANSITION_ORDER_MAXIMUM = 1024
+
 # We need to backup the builtins as they are now, as well as have a
 # reference to the actual builtins dictionary (which will change as we
 # add globals and devices to it), so that we can restore the builtins
@@ -163,14 +167,35 @@ class Device(object):
     allowed_children = None
     
     @set_passed_properties(
-        property_names = {"device_properties": ["added_properties"],
+        property_names = {"device_properties": ["added_properties", "initialization_order", "finalization_order"],
         "connection_table_properties": ["worker_host"]}
+
         )
-    def __init__(self,name,parent_device,connection, call_parents_add_device=True, 
-                 added_properties = {}, worker_host="", **kwargs):
+    def __init__(self,name,parent_device,connection, 
+                 call_parents_add_device=True, 
+                 initialization_order=1,
+                 finalization_order=1,
+                 added_properties = {},
+                 worker_host="", **kwargs):
         # Verify that no invalid kwargs were passed and the set properties
         if len(kwargs) != 0:        
             raise LabscriptError('Invalid keyword arguments: %s.'%kwargs)
+
+        # Verify that valid ordering was passed
+        if (int(initialization_order) != initialization_order or 
+            initialization_order < TRANSITION_ORDER_MINIMUM or 
+            initialization_order > TRANSITION_ORDER_MAXIMUM):
+            raise LabscriptError('initialization_order "{}" must be an integer in the '
+                                 'range {} to {} provided by TRANSITION_ORDER_MINIMUM and'
+                                 'TRANSITION_ORDER_MAXIMUM.'.format(initialization_order, TRANSITION_ORDER_MINIMUM, TRANSITION_ORDER_MAXIMUM))
+
+        # Verify that valid ordering was passed
+        if (int(finalization_order) != finalization_order or 
+            finalization_order < TRANSITION_ORDER_MINIMUM or 
+            finalization_order > TRANSITION_ORDER_MAXIMUM):
+            raise LabscriptError('finalization_order "{}" must be an integer in the '
+                                 'range {} to {} provided by TRANSITION_ORDER_MINIMUM and'
+                                 'TRANSITION_ORDER_MAXIMUM.'.format(finalization_order, TRANSITION_ORDER_MINIMUM, TRANSITION_ORDER_MAXIMUM))                    
 
         if self.allowed_children is None:
             self.allowed_children = [Device]
@@ -351,6 +376,24 @@ class Device(object):
         except Exception as e:
             raise LabscriptError('Couldn\'t find parent pseudoclock device of %s, what\'s going on? Original error was %s.'%(self.name, str(e)))
     
+    def quantise_to_pseudoclock(self, times):
+        convert_back_to = None 
+        if not isinstance(times, ndarray):
+            if isinstance(times, list):
+                convert_back_to = list
+            elif isinstance(times, set):
+                convert_back_to = set
+            else:
+                convert_back_to = float
+            times = array(times)
+        # quantise the times to the pseudoclock clock resolution
+        times = (times/self.pseudoclock_device.clock_resolution).round()*self.pseudoclock_device.clock_resolution
+        
+        if convert_back_to is not None:
+            times = convert_back_to(times)
+        
+        return times
+    
     @property 
     def parent_clock_line(self):
         if isinstance(self, ClockLine):
@@ -502,6 +545,11 @@ class Pseudoclock(Device):
         ####################################################################################################
         # convert all_change_times to a numpy array
         all_change_times_numpy = array(all_change_times)
+        
+        # quantise the all change times to the pseudoclock clock resolution
+        # all_change_times_numpy = (all_change_times_numpy/self.clock_resolution).round()*self.clock_resolution
+        all_change_times_numpy = self.quantise_to_pseudoclock(all_change_times_numpy)
+        
         # Loop through each clockline
         # print ramps_by_clockline
         for clock_line, ramps in ramps_by_clockline.items():
@@ -514,7 +562,7 @@ class Pseudoclock(Device):
                     change_times[clock_line].append(all_change_times_numpy[idx])
                 
         # Get rid of duplicates:
-        all_change_times = list(set(all_change_times))
+        all_change_times = list(set(all_change_times_numpy))
         all_change_times.sort()  
         
         # Check that the pseudoclock can handle updates this fast
@@ -531,10 +579,20 @@ class Pseudoclock(Device):
         for clock_line, change_time_list in change_times.items():
             # include trigger times in change_times, so that pseudoclocks always have an instruction immediately following a wait:
             change_time_list.extend(self.parent_device.trigger_times)
+            
+            # If the device has no children, we still need it to have a
+            # single instruction. So we'll add 0 as a change time:
+            if not change_time_list:
+                change_time_list.append(0)
+            
+            # quantise the all change times to the pseudoclock clock resolution
+            # change_time_list = (array(change_time_list)/self.clock_resolution).round()*self.clock_resolution
+            change_time_list = self.quantise_to_pseudoclock(change_time_list)
+            
             # Get rid of duplicates if trigger times were already in the list:
             change_time_list = list(set(change_time_list))
             change_time_list.sort()
-        
+            
             # Check that no two instructions are too close together:
             for i, t in enumerate(change_time_list[:-1]):
                 dt = change_time_list[i+1] - t
@@ -542,11 +600,6 @@ class Pseudoclock(Device):
                     raise LabscriptError('Commands have been issued to devices attached to %s at t= %s s and %s s. '%(self.name, str(t),str(change_time_list[i+1])) +
                                          'One or more connected devices on ClockLine %s cannot support update delays shorter than %s sec.'%(clock_line.name, str(1.0/clock_line.clock_limit)))
             
-            # If the device has no children, we still need it to have a
-            # single instruction. So we'll add 0 as a change time:
-            if not change_time_list:
-                change_time_list.append(0)
-
             # Also add the stop time as as change time. First check that it isn't too close to the time of the last instruction:
             if not self.parent_device.stop_time in change_time_list:
                 dt = self.parent_device.stop_time - change_time_list[-1]
@@ -616,7 +669,7 @@ class Pseudoclock(Device):
                     # Fix the index to the last one
                     clock_line_current_indices[clock_line] = len(change_times[clock_line]) - 1
                     # print a warning
-                    message = ''.join(['WARNING: ClockLine %s has it\'s last change time at t=%.10f but another ClockLine has a change time at t=%.10f. '%(clock_line.name, change_times[clock_line][-1], time), 
+                    message = ''.join(['WARNING: ClockLine %s has it\'s last change time at t=%.15f but another ClockLine has a change time at t=%.15f. '%(clock_line.name, change_times[clock_line][-1], time), 
                               'This should never happen, as the last change time should always be the time passed to stop(). ', 
                               'Perhaps you have an instruction after the stop time of the experiment?'])
                     sys.stderr.write(message+'\n')
@@ -717,7 +770,7 @@ class Pseudoclock(Device):
                     # Error if self.parent_device.stop_time has been set to less
                     # than the time of the last instruction:
                     elif self.parent_device.stop_time < time:
-                        raise LabscriptError('%s %s has more instructions after the experiment\'s stop time.'%(self.description,self.name))
+                        raise LabscriptError('%s %s has more instructions (at t=%.15f) after the experiment\'s stop time (t=%.15f).'%(self.description,self.name, time, self.parent_device.stop_time))
                     # If self.parent_device.stop_time is the same as the time of the last
                     # instruction, then we'll get the last instruction
                     # out still, so that the total number of clock
@@ -893,6 +946,9 @@ class PseudoclockDevice(TriggerableDevice):
             
             # Modify the trigger times themselves so that we insert wait instructions at the right times:
             self.trigger_times = [round(t - initial_trigger_time - i*self.trigger_delay,10) for i, t in enumerate(self.trigger_times)]
+        
+        # quantise the stop time to the pseudoclock clock resolution
+        self.stop_time = self.quantise_to_pseudoclock(self.stop_time)
                             
     def generate_code(self, hdf5_file):
         outputs = self.get_all_outputs()
@@ -1092,12 +1148,12 @@ class Output(Device):
             offset = round(offset,10)
             if isinstance(instruction,dict):
                 offset_instruction = instruction.copy()
-                offset_instruction['end time'] = round(instruction['end time'] - offset,10)
-                offset_instruction['initial time'] = round(instruction['initial time'] - offset,10)
+                offset_instruction['end time'] = self.quantise_to_pseudoclock(round(instruction['end time'] - offset,10))
+                offset_instruction['initial time'] = self.quantise_to_pseudoclock(round(instruction['initial time'] - offset,10))
             else:
                 offset_instruction = instruction
                 
-            offset_instructions[round(t - offset,10)] = offset_instruction
+            offset_instructions[self.quantise_to_pseudoclock(round(t - offset,10))] = offset_instruction
         self.instructions = offset_instructions
             
         # offset each of the ramp_limits for use in the calculation within Pseudoclock/ClockLine
@@ -1111,7 +1167,7 @@ class Output(Device):
             # offset start and end time of ramps
             # NOTE: This assumes ramps cannot proceed across a trigger command
             #       (for instance you cannot ramp an output across a WAIT)
-            self.ramp_limits[i] = (round(times[0]-offset,10), round(times[1]-offset,10))
+            self.ramp_limits[i] = (self.quantise_to_pseudoclock(round(times[0]-offset,10)), self.quantise_to_pseudoclock(round(times[1]-offset,10)))
             
     def get_change_times(self):
         """If this function is being called, it means that the parent
@@ -1992,12 +2048,15 @@ def start():
         else:
             min_clock_limit = master_pseudoclock.clock_limit
     
+        # ensure we don't tick faster than attached devices to the master pseudoclock can handle
+        clockline_limits = [clockline.clock_limit for pseudoclock in master_pseudoclock.child_devices for clockline in pseudoclock.child_devices]
+        min_clock_limit = min(min_clock_limit, min(clockline_limits))
     
         # check the minimum trigger duration for the waitmonitor
         if compiler.wait_monitor is not None:
             compiler.trigger_duration = max(compiler.trigger_duration, 2.0/compiler.wait_monitor.clock_limit)
         # Provide this, or the minimum possible pulse, whichever is longer:
-        compiler.trigger_duration = max(2.0/min_clock_limit, compiler.trigger_duration)
+        compiler.trigger_duration = max(2.0/min_clock_limit, compiler.trigger_duration) + 2*master_pseudoclock.clock_resolution
         # Must wait this long before providing a trigger, in case child clocks aren't ready yet:
         compiler.wait_delay = max_or_zero([pseudoclock.wait_delay for pseudoclock in pseudoclocks if not pseudoclock.is_master_pseudoclock])
         
