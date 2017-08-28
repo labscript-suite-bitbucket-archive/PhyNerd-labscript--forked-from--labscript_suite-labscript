@@ -177,7 +177,6 @@ class Device(object):
         self.parent_device = parent_device
         self.connection = connection
         self.child_devices = []
-        self.worker_host = worker_host
 
         if worker_host != "":
             self.set_property('worker_host', worker_host, location='connection_table_properties', overwrite=True)
