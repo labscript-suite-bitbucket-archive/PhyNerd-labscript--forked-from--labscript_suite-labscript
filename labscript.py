@@ -163,7 +163,7 @@ class Device(object):
     allowed_children = None
     
     @set_passed_properties(
-        property_names = {"device_properties": ["added_properties"], "connection_table_properties": ["worker_host"]}
+        property_names = {"device_properties": ["added_properties"]}
         )
     def __init__(self,name,parent_device,connection, call_parents_add_device=True, 
                  worker_host="", added_properties = {}, **kwargs):
@@ -178,7 +178,10 @@ class Device(object):
         self.connection = connection
         self.child_devices = []
         self.worker_host = worker_host
-        
+
+        if worker_host != "":
+            self.set_property('worker_host', worker_host, location='connection_table_properties', overwrite=True)
+
         # self._properties may be instantiated already
         if not hasattr(self, "_properties"):
             self._properties = {}
